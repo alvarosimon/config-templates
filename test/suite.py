@@ -19,11 +19,20 @@ Usage: "python -m test.suite" or "python test/suite.py"
 
 @author: Stijn De Weirdt (Ghent University)
 """
+
+# set sys.path to avoid explicit PYTHONPATH setting in default use mode
+import os
+import sys
+_reldir = os.path.dirname(os.path.dirname(__file__))
+_absdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if not (_reldir in sys.path or _absdir in sys.path):
+    sys.path.insert(0, _absdir)
+
 import glob
+import operator
 import os
 import re
 import shutil
-import sys
 import tempfile
 import unittest
 
@@ -35,8 +44,8 @@ from vsc.utils import fancylogger
 
 
 log = None
-JSON2TT = None
-TEMPLATE_LIBRARY_CORE = None  # abs path to quattor template-libary-core
+
+TEST_CLASS_ATTRS = None
 
 OBJECT_PROFILE_REGEX = re.compile(r'^object\s+template\s+(?P<prof>\S+)\s*;\s*$', re.M)
 
@@ -50,6 +59,46 @@ REGEXPS_SUPPORTED_FLAGS = {
     'I': re.I,
 }
 
+# parse each reguar expression line
+# if count is not None, the regular expression has to match exactly this number
+# (count can be 0 to negate a single regexp)
+REGEXP_REGEXP = re.compile('^\s*(?P<regex>.*?)\s*(?:\s#{3}\sCOUNT\s(?P<count>\d+))?$')
+
+
+# some help / documentation
+# format is key : (help, is_prefix)
+SUPPORTED_FLAGS = {
+    'multiline': ('Treat all regexps as multiline regexps', False),
+    'M': ('shorthand for "multiline"', False),
+    'caseinsensitive': ('Perform case-insensitive matches', False),
+    'I': ('alias for "caseinsensitive"', False),
+    'metaconfigservice=': ('Look for module/contents in the expected metaconfig component path for the service', True),
+    'negate': ('Negate all regexps (none of the regexps can match) (not applicable when COUNT is set for individual regexp)', False),
+}
+
+
+def valid_flag(flag):
+    """Check if flag is a valid flag"""
+    exact = [flag == k for k, v in SUPPORTED_FLAGS.items() if not v[0]]
+    prefix = [flag.startswith(k) for k, v in SUPPORTED_FLAGS.items() if v[0]]
+
+    # assuming python 2.6
+    return any(exact + prefix)
+
+
+def flag_help(supported=False):
+    """Return some flag help. If supported, then return the list of supported flags"""
+    flags = SUPPORTED_FLAGS.keys()
+    flags.sort()
+    supported_txt = "supported flags: %s" % ', '.join(flags)
+    if supported:
+        return supported_txt
+
+    txt = "%s\n" % supported_txt
+    for flag in flags:
+        descr = SUPPORTED_FLAGS[flag][0]
+        txt += "%s%s: %s\n" % (' ' * 4, flag, descr)
+    return txt
 
 def find_tt_files(path):
     """Return list of relative path to .tt files"""
@@ -109,6 +158,7 @@ def parse_regexp(fn):
     blocks = REGEXPS_SEPARATOR_REGEX.split(open(fn).read())
     if not len(blocks) == REGEXPS_EXPECTED_BLOCKS:
         log.error('Found %s blocks, more/less then number of expected blocks %s' % (len(blocks), REGEXPS_EXPECTED_BLOCKS))
+        return
 
     description = blocks[0].strip().replace("\n", " "*2)  # make single line
     flags = [x.strip() for x in blocks[1].strip().split("\n") if x.strip()]
@@ -116,23 +166,47 @@ def parse_regexp(fn):
 
     extra_flags = {}
 
+    # operator tuple: the operator, and message incase of failure of the test
+    # test is assertTrue(op(regexp.search(output)))
+    # message is put before the regexp pattern
+    op = [operator.truth, '']
     re_flags = 0
     for flag in flags:
-        if flag.startswith('metaconfigservice='):
-            extra_flags['mode'] = ('--' + flag).split('=')
-        elif flag in REGEXPS_SUPPORTED_FLAGS:
-            re_flags |= REGEXPS_SUPPORTED_FLAGS[flag]
-        else:
-            log.error('Unknown flag %s (supported: %s). Ignoring' % (flag, REGEXPS_SUPPORTED_FLAGS.keys() + ['metaconfigservice=']))
+        # if flag starts with a /, interpret it as the absolute path of a metaconfigservice
+        # intentionally not using os.path.sep
+        if flag.startswith('/'):
+            log.info('Flag %s interpreted as absolute path for metaconfigservice')
+            flag = 'metaconfigservice=%s' % flag
+
+        # extra check
+        if not valid_flag(flag):
+            log.error('Unknown flag %s (%s). Ignoring' % (flag, flag_help(supported=True)))
             continue
 
+        if flag.startswith('metaconfigservice='):
+            extra_flags['mode'] = ('--' + flag).split('=')
+        elif flag == 'negate':
+            op = [operator.not_, 'negated ']
+        elif flag in REGEXPS_SUPPORTED_FLAGS:
+            re_flags |= REGEXPS_SUPPORTED_FLAGS[flag]
+
     regexps_compiled = []
-    for regexps_str in regexps_strs:
+    for line in regexps_strs:
+        r_line = REGEXP_REGEXP.search(line)
+        if not r_line:
+            # how did we get here?
+            log.error("Invalid regular expression line %s. Skipping." % line)
+            continue
+
+        regexps_str = r_line.groupdict()['regex']
         try:
             r = re.compile(regexps_str, re_flags)
-        except Exception, e:
-            log.error("Failed to compile regexps_str %s with flags %s: %s" % (regexps_str, re_flags, e))
-        regexps_compiled.append(r)
+            count = r_line.groupdict().get('count', None)
+            if count is None:
+                count = -1
+            regexps_compiled.append([op, r, int(count)])
+        except re.error, e:
+            log.error("Failed to compile regexps_str %s with flags %s: %s. Skipping." % (regexps_str, re_flags, e))
 
     return description, regexps_compiled, extra_flags
 
@@ -141,22 +215,36 @@ def parse_regexps(fns):
     """Parse each regex, returns a list of tuples with description and list of compiled regexpes"""
     res = []
     for fn in fns:
-        res.append(parse_regexp(fn))
+        result = parse_regexp(fn)
+        if result is None:
+            log.error("Failed to parse regexp file %s. Skipping." % fn)
+        else:
+            res.append(result)
+
+    # sanity check on the extra_flags
+    # all extra_flags update the same dict later on
+    #  - only allow one mode
+    modes = [x[2]['mode'] for x in res if 'mode' in x[2]]
+    # check if all equal to first element
+    if modes and not all(map(lambda x: x == modes[0], modes)):
+        log.error("Not all modes are equal (or None): found %s" % modes)
+        return []
+
     return res
 
 
 def get_regexps(path, profs):
     """Get the regular expressions for each profile as a dict."""
     res = {}
-    for regexp in os.listdir(path):
-        if not regexp in profs:
-            log.error('Regexp file/dir %s found that has no profile. ignoring' % regexp)
+    for regexp_name in os.listdir(path):
+        if regexp_name not in profs:
+            log.error('Regexp file/dir %s found that has no profile. ignoring' % regexp_name)
             continue
 
-        # regexp is now name of profile
+        # regexp_name is now name of profile
 
         regexp_files = []
-        abs_regexp = os.path.join(path, regexp)
+        abs_regexp = os.path.join(path, regexp_name)
         if os.path.isfile(abs_regexp):
             regexp_files.append(abs_regexp)
         elif os.path.isdir(abs_regexp):
@@ -165,7 +253,7 @@ def get_regexps(path, profs):
             log.error('unsupported regexp %s (should be file or directory)' % abs_regexp)
             continue
 
-        res[regexp] = parse_regexps(regexp_files)
+        res[regexp_name] = parse_regexps(regexp_files)
 
     return res
 
@@ -179,9 +267,8 @@ def make_regexps_unittests(service, profpath, templatepath, regexps_map):
         'PROFILEPATH': profpath,
         'TEMPLATEPATH': templatepath,
         'METACONFIGPATH': os.path.dirname(templatepath),
-        'JSON2TT': JSON2TT,
-        'TEMPLATE_LIBRARY_CORE': TEMPLATE_LIBRARY_CORE,
     }
+    attrs.update(TEST_CLASS_ATTRS)
 
     # create test cases
     #     one testcase class per service
@@ -244,22 +331,10 @@ def make_tests(path, tests):
 
 
 def validate(service=None, tests=None, path=None):
-    """Validate the directory structure and return the test modules suite() results"""
-    if path is None:
-        # use absolute path
-        testdir = os.path.dirname(os.path.abspath(__file__))
-        basedir = os.path.dirname(testdir)
-        path = os.path.join(basedir, 'metaconfig')
-        # assume a checkout of template-library-core in same workspace
-        quattortemplatecorepath = os.path.join(os.path.dirname(basedir), 'template-library-core')
-
-        # set it
-        global JSON2TT
-        JSON2TT = os.path.join(basedir, 'scripts', 'json2tt.pl')
-
-        global TEMPLATE_LIBRARY_CORE
-        TEMPLATE_LIBRARY_CORE = quattortemplatecorepath
-
+    """Validate the directory structure and return the test modules suite() results.
+    @param service: only process the specified service, when None, process all services
+    @param tests: only process the specified tests, when None, process all tests
+    """
     res = []
     for srvc in os.listdir(path):
         if service and not srvc == service:
@@ -287,19 +362,70 @@ def validate(service=None, tests=None, path=None):
 
     return res
 
+
+def exportpan(path, exportpan):
+    """Create pan namespace for all services and copy all templates"""
+    log.info("Going to export the pan templates to directory %s" % exportpan)
+    for srvc in os.listdir(path):
+        pandir = os.path.join(exportpan, 'metaconfig', srvc)
+        shutil.copytree(os.path.join(path, srvc, 'pan'), pandir)
+
+
 if __name__ == '__main__':
-    # make sure temporary files can be created/used
+    # use absolute path
+    testdir = os.path.dirname(os.path.abspath(__file__))
+    basedir = os.path.dirname(testdir)
+    path = os.path.join(basedir, 'metaconfig')
+
+    # default: use json2tt.pl from this release
+    json2tt = os.path.join(basedir, 'scripts', 'json2tt.pl')
+    # default: assume a checkout of template-library-core in same workspace
+    quattortemplatecorepath = os.path.join(os.path.dirname(basedir), 'template-library-core')
+    # create tempdir for export (has to be removed when not used!)
+    export_tmpdir = tempfile.mkdtemp(prefix='exportpan_')
+
     opts = {
-        "service" : ("Select one service to test", None, "store", None, 's'),
-        "tests" : ("Select specific test for given service", "strlist", "store", None, 't'),
+        "service" : ("Select one service to test (when not specified, run all services)", None, "store", None, 's'),
+        "tests" : ("Select specific test for given service (when not specified, run all tests)", "strlist", "store", None, 't'),
+        "json2tt": ("Path to json2tt.pl script", None, "store", json2tt, 'j'),
+        "core" : ("Path to clone of template-library-core repo", None, "store", quattortemplatecorepath, 'C'),
+        "showjson": ("Show the generated profile JSON", None, "store_true", None, 'J'),
+        "showtt": ("Show the generated TT output for each profile", None, "store_true", None, 'T'),
+        "showflags": ("Show the flags and description and exit", None, "store_true", None),
+        "exportpan": ("Export all services pan files in proper namespace", None, "store_or_None", export_tmpdir, 'E'),
     }
     go = simple_option(opts)
+
+    if go.options.exportpan is None or go.options.exportpan != export_tmpdir:
+        # clean export_tmpdir up if not used
+        shutil.rmtree(export_tmpdir)
+
+    if go.options.exportpan:
+        # run all tests
+        if go.options.service or go.options.tests:
+            go.log.info('Running all tests of all services before export, ignoring selected services/tests')
+            go.options.service = None
+            go.options.tests = None
+
+    if go.options.showflags:
+        print flag_help()
+        sys.exit(0)
+
+    TEST_CLASS_ATTRS = {
+        'JSON2TT': go.options.json2tt,
+        'TEMPLATE_LIBRARY_CORE': go.options.core,
+        'SHOWJSON' : go.options.showjson,
+        'SHOWTT' : go.options.showtt,
+    }
 
     # no tests without service
     if go.options.tests and not go.options.service:
         go.log.error('Tests specified but no service.')
         sys.exit(1)
 
+    # TODO test panc version. has to be 10.1 (panc has no --version?)
+
+    # make sure temporary files can be created/used
     fd, fn = tempfile.mkstemp()
     os.close(fd)
     os.remove(fn)
@@ -320,7 +446,7 @@ if __name__ == '__main__':
     fancylogger.logToFile(log_fn)
     log = fancylogger.getLogger()
 
-    SUITE = unittest.TestSuite(validate(service=go.options.service, tests=go.options.tests))
+    SUITE = unittest.TestSuite(validate(path=path, service=go.options.service, tests=go.options.tests))
 
     # uses XMLTestRunner if possible, so we can output an XML file that can be supplied to Jenkins
     xml_msg = ""
@@ -330,15 +456,19 @@ if __name__ == '__main__':
         res = xmlrunner.XMLTestRunner(output=xml_dir, verbosity=1).run(SUITE)
         xml_msg = ", XML output of tests available in %s directory" % xml_dir
     except ImportError, err:
-        sys.stderr.write("WARNING: xmlrunner module not available, falling back to using unittest...\n\n")
+        log.warning("xmlrunner module not available, falling back to using unittest...\n\n")
         res = unittest.TextTestRunner().run(SUITE)
 
-    fancylogger.logToFile(log_fn, enable=False)
 
     if not res.wasSuccessful():
-        sys.stderr.write("ERROR: Not all tests were successful.\n")
-        print "Log available at %s" % log_fn, xml_msg
+        log.error("Not all tests were successful. Log available at %s" % (log_fn))
         sys.exit(2)
     else:
+        if go.options.exportpan:
+            exportpan(path, go.options.exportpan)
+            print "Pan files exported to directory %s" % go.options.exportpan
+
+        fancylogger.logToFile(log_fn, enable=False)
         for f in glob.glob('%s*' % log_fn):
             os.remove(f)
+

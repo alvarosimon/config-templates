@@ -21,10 +21,10 @@ Custom TestCase
 """
 
 import logging
+import operator
 import os
 import shutil
 import tempfile
-
 
 from unittest import TestCase
 from vsc.utils.run import run_asyncloop
@@ -37,18 +37,39 @@ def gen_test_func(profile, regexps_tuples, **make_result_extra_flags):
 
         # make this a test in case of failure for proper reporting
         # -> all other tests will fail anyway
-        if not self.pancout is None:
+        if not regexps_tuples:
+            self.assertTrue(False, 'No regexp tests for %s' % (profile))
+            return
+
+        if self.pancout is not None:
             self.assertTrue(False, 'No json for %s (panc failed: %s)' % (profile, self.pancout))
             return
 
-        if not self.json2ttout is None:
+        if self.json2ttout is not None:
             self.assertTrue(False, 'No tt output for %s (json2tt failed: %s)' % (profile, self.json2ttout))
             return
 
-        for descr, compiled_regexps in regexps_tuples:
-            for idx, compiled_regexp in enumerate(compiled_regexps):
-                msg = "%s (%03d) pattern %s output\n%s" % (descr, idx, compiled_regexp.pattern, self.result)
-                self.assertTrue(compiled_regexp.search(self.result), msg)
+        for descr, compiled_regexp_tuples in regexps_tuples:
+            for idx, (op, compiled_regexp, count) in enumerate(compiled_regexp_tuples):
+                if count < 0:
+                    to_check = compiled_regexp.search(self.result)
+                    extra_msg = ''
+                else:
+                    all_matches = compiled_regexp.findall(self.result)
+                    count_matches = len(all_matches)
+                    to_check = count_matches == count
+                    extra_msg = " COUNT set: expected %s matches, all matches (%s): %s" % (count, count_matches, all_matches)
+
+                    # The negate flag is ignored when count is set.
+                    # Stating regexp foo must not appear exactly three times is overengineering this.
+                    if not op == operator.truth:
+                        extra_msg += ' (forcing operator.truth; thus ignoring flag (e.g. negate))'
+                        op[0] = operator.truth
+
+                msg = "%s regexp (%03d) %spattern %s%s\noutput:\n%s"
+                tup = (descr, idx, op[1], compiled_regexp.pattern, extra_msg, self.result)
+                self.assertTrue(op[0](to_check), msg % tup)
+
     return test_func
 
 
@@ -58,20 +79,25 @@ class RegexpTestCase(TestCase):
     PROFILEPATH = None  # absolute path of profiles folder
     METACONFIGPATH = None  # absolute path to metaconfig subdir
     TEMPLATEPATH = None  # absolute path of templates folder
+
     JSON2TT = None  # absolute path to the json2tt.pl tool
     TEMPLATE_LIBRARY_CORE = None  # abs path to template library core (mainly for pan/types etc)
+    SHOWJSON = False  # print the generated JSON from profile compilation
+    SHOWTT = False  # print the generated output from JSON2TT
 
     def setUp(self):
-        """Set up testcase."""
+        """Set up testcase. This makes a copy of the templates under service/pan 
+        (like the schema.pan) and puts them in the expected namespace 
+        metaconfig/<service>/.
+        No other copies are made, but this requires panc 10.1 to work.
+        """
         self.servicepath = os.path.join(self.METACONFIGPATH, self.SERVICE)
         self.tmpdir = tempfile.mkdtemp()
-        self.profilesdir = os.path.join(self.tmpdir, '_profiles')
         self.extradir = os.path.join(self.tmpdir, '_extra')
-        # copy all profiles and pan dir in _profiles dir (allows to include and test the schema)
+        # copy metaconfig/<service>/pan directory in self.extradir directory
+        # (allows to include and test the schema) this creates the correct namespace
+        # (templates in the pan directory are in metaconfig/<service>/ namespace)
         pandir = os.path.join(self.extradir, 'metaconfig', self.SERVICE)
-        # makes self.profilesdir
-        shutil.copytree(self.PROFILEPATH, self.profilesdir)
-        shutil.copytree(self.TEMPLATE_LIBRARY_CORE, self.extradir)
         shutil.copytree(os.path.join(self.servicepath, 'pan'), pandir)
 
     def makeResult(self, profile, mode=None):
@@ -80,25 +106,25 @@ class RegexpTestCase(TestCase):
         self.pancout = None
         self.json2ttout = None
 
-        cwd = os.getcwd()
-        os.chdir(self.profilesdir)
+        includepaths = [self.PROFILEPATH, self.extradir, self.TEMPLATE_LIBRARY_CORE]
 
         cmd = [
             'panc',
             '--formats' , 'json',
-            '--include-path', os.pathsep.join([self.profilesdir, self.extradir]),
+            '--include-path', os.pathsep.join(includepaths),
             '--output-dir', tmpdir,
-            "%s.pan" % profile
+            os.path.join(self.PROFILEPATH, "%s.pan" % profile)
             ]
         ec, out = run_asyncloop(cmd)
-        # change back
-        os.chdir(cwd)
 
         jsonfile = os.path.join(tmpdir, "%s.json" % profile)
         if not os.path.exists(jsonfile):
             logging.debug("No json file found for service %s and profile %s. cmd %s output %s" % (self.SERVICE, profile, cmd, out))
             self.pancout = out
             return
+
+        if self.SHOWJSON:
+            print "profile %s JSON:\n%s" % (profile, open(jsonfile).read())
 
         if mode is None:
             mode = ['--unittest']
@@ -114,6 +140,8 @@ class RegexpTestCase(TestCase):
             return
 
         self.result = out
+        if self.SHOWTT:
+            print "profile %s TT output:\n%s" % (profile, out)
 
     def tearDown(self):
         """Clean up after running testcase."""
